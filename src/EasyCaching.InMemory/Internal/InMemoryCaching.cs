@@ -1,15 +1,22 @@
 ﻿namespace EasyCaching.InMemory
 {
     using EasyCaching.Core;
+    using Microsoft.Extensions.ObjectPool;
     using System;
+    using System.Buffers;
     using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Linq;
+    using System.Text.Json;
     using System.Threading;
     using System.Threading.Tasks;
 
     public class InMemoryCaching : IInMemoryCaching
     {
+        private static readonly DefaultPooledObjectPolicy<CacheEntry> _defalutPolicy = new DefaultPooledObjectPolicy<CacheEntry>();
+        private static readonly DefaultObjectPool<CacheEntry> _defaultPool = new DefaultObjectPool<CacheEntry>(_defalutPolicy, 1_000_000);
+        private static readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
+
         private readonly ConcurrentDictionary<string, CacheEntry> _memory;
         private DateTimeOffset _lastExpirationScan;
         private readonly InMemoryCachingOptions _options;
@@ -25,7 +32,7 @@
 
             _name = name;
             _options = optionsAccessor;
-            _memory = new ConcurrentDictionary<string, CacheEntry>();
+            _memory = _options.SizeLimit.HasValue ? new ConcurrentDictionary<string, CacheEntry>() : new ConcurrentDictionary<string, CacheEntry>(8, _options.SizeLimit.Value * 2);
             _lastExpirationScan = SystemClock.UtcNow;
         }
 
@@ -35,6 +42,7 @@
         {
             if (string.IsNullOrWhiteSpace(prefix))
             {
+                ResetPool();
                 _memory.Clear();
 
                 if (_options.SizeLimit.HasValue)
@@ -55,8 +63,10 @@
 
         internal void RemoveExpiredKey(string key)
         {
-            if (_memory.TryRemove(key, out _))
+            if (_memory.TryRemove(key, out CacheEntry entry))
             {
+                ReturnCacheEntity(entry);
+
                 Evicted?.Invoke(this, new EvictedEventArgs(key));
 
                 if (_options.SizeLimit.HasValue)
@@ -121,7 +131,7 @@
             ArgumentCheck.NotNullOrWhiteSpace(key, nameof(key));
 
             var expiresAt = expiresIn.HasValue ? SystemClock.UtcNow.SafeAdd(expiresIn.Value) : DateTimeOffset.MaxValue;
-            return SetInternal(new CacheEntry(key, value, expiresAt), true);
+            return SetInternal(GetCacheEntity(key, value, expiresAt), true);
         }
 
         public bool Set<T>(string key, T value, TimeSpan? expiresIn = null)
@@ -129,7 +139,7 @@
             ArgumentCheck.NotNullOrWhiteSpace(key, nameof(key));
 
             var expiresAt = expiresIn.HasValue ? SystemClock.UtcNow.SafeAdd(expiresIn.Value) : DateTimeOffset.MaxValue;
-            return SetInternal(new CacheEntry(key, value, expiresAt));
+            return SetInternal(GetCacheEntity(key, value, expiresAt));
         }
 
         private bool SetInternal(CacheEntry entry, bool addOnly = false)
@@ -143,7 +153,7 @@
             if (_options.SizeLimit.HasValue && Interlocked.Read(ref _cacheSize) >= _options.SizeLimit)
             {
                 // prevent alaways access the following logic after up to limit
-                if (_memory.TryAdd(_UPTOLIMIT_KEY, new CacheEntry(_UPTOLIMIT_KEY, 1, DateTimeOffset.UtcNow.AddSeconds(5))))
+                if (_memory.TryAdd(_UPTOLIMIT_KEY, new CacheEntry(_UPTOLIMIT_KEY, new byte[0], 0, DateTimeOffset.UtcNow.AddSeconds(5))))
                 {
                     var shouldRemoveCount = 5;
 
@@ -223,6 +233,7 @@
         {
             if (keys == null)
             {
+                ResetPool();
                 if (_options.SizeLimit.HasValue)
                 {
                     int count = (int)Interlocked.Read(ref _cacheSize);
@@ -244,8 +255,9 @@
                 if (string.IsNullOrEmpty(key))
                     continue;
 
-                if (_memory.TryRemove(key, out _))
+                if (_memory.TryRemove(key, out CacheEntry entry))
                 {
+                    ReturnCacheEntity(entry);
                     removed++;
                     if (_options.SizeLimit.HasValue)
                         Interlocked.Decrement(ref _cacheSize);
@@ -257,7 +269,11 @@
 
         public bool Remove(string key)
         {
-            bool flag = _memory.TryRemove(key, out _);
+            bool flag = _memory.TryRemove(key, out CacheEntry entry);
+            if (flag)
+            {
+                ReturnCacheEntity(entry);
+            }
 
             if (_options.SizeLimit.HasValue && !key.Equals(_UPTOLIMIT_KEY) && flag)
             {
@@ -381,15 +397,86 @@
             return TimeSpan.Zero;
         }
 
+        /// <summary>
+        /// 获取实体
+        /// </summary>
+        /// <param name="key"></param>
+        /// <param name="value"></param>
+        /// <param name="expiresAt"></param>
+        /// <returns></returns>
+        private CacheEntry GetCacheEntity(string key, object value, DateTimeOffset expiresAt)
+        {
+            var entry = _defaultPool.Get();
+
+            var value2 = ConvertToBytes(value);
+            var value3 = _arrayPool.Rent(value2.Length);
+            value2.CopyTo(value3, 0);
+            var valueLength = value2.Length;
+            value2 = null;
+
+            entry.Init(key, value3, valueLength, expiresAt);
+            return entry;
+        }
+
+        /// <summary>
+        /// 归还实体
+        /// </summary>
+        /// <param name="entry"></param>
+        private void ReturnCacheEntity(CacheEntry entry)
+        {
+            _arrayPool.Return(entry.Value);
+            entry.Value = null;
+            _defaultPool.Return(entry);
+        }
+
+        /// <summary>
+        /// 重置pool
+        /// </summary>
+        private void ResetPool()
+        {
+            RemoveAll(_memory.Keys);
+        }
+
+        /// <summary>
+        /// 序列化
+        /// </summary>
+        /// <param name="obj"></param>
+        /// <returns></returns>
+        private static byte[] ConvertToBytes(object obj)
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(obj);
+        }
+
+        /// <summary>
+        /// 反序列化
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="bytes"></param>
+        /// <param name="index"></param>
+        /// <param name="count"></param>
+        /// <returns></returns>
+        private static T ConvertToObj<T>(byte[] bytes, int index, int count)
+        {
+            return JsonSerializer.Deserialize<T>(System.Text.Encoding.UTF8.GetString(bytes, index, count));
+        }
+
         private class CacheEntry
         {
-            private object _cacheValue;
+            private byte[] _cacheValue;
             private static long _instanceCount;
 
-            public CacheEntry(string key, object value, DateTimeOffset expiresAt)
+            public CacheEntry() { }
+
+            public CacheEntry(string key, byte[] value, int valueLength, DateTimeOffset expiresAt)
+            {
+                Init(key, value, valueLength, expiresAt);
+            }
+
+            public void Init(string key, byte[] value, int valueLength, DateTimeOffset expiresAt)
             {
                 Key = key;
                 Value = value;
+                ValueLength = valueLength;
                 ExpiresAt = expiresAt;
                 LastModifiedTicks = SystemClock.UtcNow.Ticks;
                 InstanceNumber = Interlocked.Increment(ref _instanceCount);
@@ -400,11 +487,12 @@
             internal DateTimeOffset ExpiresAt { get; set; }
             internal long LastAccessTicks { get; private set; }
             internal long LastModifiedTicks { get; private set; }
+            internal int ValueLength { get; private set; }
 
             /// <summary>
             /// the cache value
             /// </summary>
-            internal object Value
+            internal byte[] Value
             {
                 get
                 {
@@ -426,19 +514,7 @@
             /// <returns></returns>
             public T GetValue<T>(bool isDeepClone = true)
             {
-                object val = Value;
-
-                var t = typeof(T);
-
-                if (t == TypeHelper.BoolType || t == TypeHelper.StringType || t == TypeHelper.CharType || t == TypeHelper.DateTimeType || t.IsNumeric())
-                    return (T)Convert.ChangeType(val, t);
-
-                if (t == TypeHelper.NullableBoolType || t == TypeHelper.NullableCharType || t == TypeHelper.NullableDateTimeType || t.IsNullableNumeric())
-                    return val == null ? default(T) : (T)Convert.ChangeType(val, Nullable.GetUnderlyingType(t));
-
-                return isDeepClone
-                    ? DeepClonerGenerator.CloneObject<T>((T)val)
-                    : (T)val;
+                return ConvertToObj<T>(Value, 0, ValueLength);
             }
         }
     }
